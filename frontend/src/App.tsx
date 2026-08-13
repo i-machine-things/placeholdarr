@@ -31,7 +31,7 @@ import {
 } from "./api/dashboard";
 import { postTaskRun } from "./api/tasks";
 import { fetchJson, postJson, setUnauthorizedHandler, getCsrfToken } from "./api/client";
-import { changePassword, getAuthStatus, logoutAuth, type AuthStatus } from "./api/auth";
+import { changePassword, getAuthStatus, logoutAuth, regenerateWebhookApiKey, type AuthStatus } from "./api/auth";
 import { AuthGate } from "./auth/AuthGate";
 import embyIcon from "./assets/services/emby.svg";
 import jellyfinIcon from "./assets/services/jellyfin.svg";
@@ -1398,6 +1398,10 @@ export function App() {
         nextValues[field.key] = field.value;
       });
     });
+    // Not a settings field — read-only, used only by the webhook-URL builders
+    // below (resolveWebhookApiKey). See services/auth.py's
+    // ensure_webhook_api_key() for where this comes from.
+    nextValues.WEBHOOK_API_KEY = payload.webhook_api_key ?? "";
 
     setFieldValues(nextValues);
     setBaselineValues(nextValues);
@@ -5237,11 +5241,24 @@ function resolveWebhookDisplayOrigin(values: FieldValueMap): string {
   return typeof window !== "undefined" ? window.location.origin : "";
 }
 
-function buildArrInstanceWebhookUrls(origin: string, instance_id: string, instance_key: string) {
+/** /webhook requires ?apikey= (see services/auth.py's verify_webhook_api_key) —
+ * read from the same values map the settings payload already populates it
+ * into (App.tsx's loadSettings), so no separate fetch/prop-threading is needed. */
+function resolveWebhookApiKey(values: FieldValueMap): string {
+  return String(values.WEBHOOK_API_KEY ?? "").trim();
+}
+
+function appendWebhookApiKey(url: string, apiKey: string): string {
+  if (!url || !apiKey) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}apikey=${encodeURIComponent(apiKey)}`;
+}
+
+function buildArrInstanceWebhookUrls(origin: string, instance_id: string, instance_key: string, apiKey: string) {
   const id = String(instance_id || "").trim().toLowerCase();
   const key = normalizeInstanceKey(String(instance_key || ""));
-  const byId = id ? `${origin}/webhook?instance_id=${encodeURIComponent(id)}` : "";
-  const byKey = `${origin}/webhook?instance=${encodeURIComponent(key)}`;
+  const byId = id ? appendWebhookApiKey(`${origin}/webhook?instance_id=${encodeURIComponent(id)}`, apiKey) : "";
+  const byKey = appendWebhookApiKey(`${origin}/webhook?instance=${encodeURIComponent(key)}`, apiKey);
   const uuidLike = id.length > 0 && arrInstanceIdEmbedsUuid(id);
   const primary = id ? byId : byKey;
   return { primary, byId: id ? byId : "", byKey, uuidLike };
@@ -5839,7 +5856,8 @@ function ArrInstancesEditor(props: {
 
   function instanceWebhookUrls(instance_id: string, instance_key: string) {
     const origin = resolveWebhookDisplayOrigin(props.values);
-    return buildArrInstanceWebhookUrls(origin, instance_id, instance_key);
+    const apiKey = resolveWebhookApiKey(props.values);
+    return buildArrInstanceWebhookUrls(origin, instance_id, instance_key, apiKey);
   }
 
   function onSlotPanelSaveClick() {
@@ -6983,6 +7001,8 @@ function SecurityAccountControls(props: {
   authStatus: AuthStatus | null;
   accentHex: string;
   onLogout: () => Promise<void>;
+  webhookApiKey: string;
+  onWebhookApiKeyChange: (key: string) => void;
 }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -6992,6 +7012,37 @@ function SecurityAccountControls(props: {
   const [error, setError] = useState<string | null>(null);
   const mode = props.authStatus?.mode || "builtin";
   const username = props.authStatus?.username;
+
+  const [webhookKey, setWebhookKey] = useState(props.webhookApiKey);
+  useEffect(() => setWebhookKey(props.webhookApiKey), [props.webhookApiKey]);
+  const [webhookKeyRevealed, setWebhookKeyRevealed] = useState(false);
+  const [webhookRegenConfirming, setWebhookRegenConfirming] = useState(false);
+  const [webhookRegenBusy, setWebhookRegenBusy] = useState(false);
+  const [webhookRegenMessage, setWebhookRegenMessage] = useState<string | null>(null);
+  const [webhookRegenError, setWebhookRegenError] = useState<string | null>(null);
+
+  async function onRegenerateWebhookKey() {
+    setWebhookRegenBusy(true);
+    setWebhookRegenError(null);
+    setWebhookRegenMessage(null);
+    try {
+      const result = await regenerateWebhookApiKey();
+      setWebhookKey(result.webhook_api_key);
+      // Propagate into fieldValues so buildArrInstanceWebhookUrls/
+      // PlaybackWebhookSetupModal show the new key immediately, without
+      // needing a full settings reload. WEBHOOK_API_KEY isn't a real
+      // SETTINGS_SCHEMA field (see settingsValuesDirty), so this can't
+      // spuriously trip the unsaved-changes warning.
+      props.onWebhookApiKeyChange(result.webhook_api_key);
+      setWebhookKeyRevealed(true);
+      setWebhookRegenConfirming(false);
+      setWebhookRegenMessage("Webhook key regenerated. Update the URL in every Radarr/Sonarr/Tautulli/Jellyfin/Emby webhook.");
+    } catch (err) {
+      setWebhookRegenError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setWebhookRegenBusy(false);
+    }
+  }
 
   async function onChangePassword(event: FormEvent) {
     event.preventDefault();
@@ -7031,6 +7082,64 @@ function SecurityAccountControls(props: {
                 : "Admin account"}
         </p>
       </div>
+      {mode !== "disabled" ? (
+        <div className="max-w-md space-y-2">
+          <p className="text-[14px] text-slate-400">Webhook API key</p>
+          <p className="ui-field-description text-slate-400">
+            Required as <code>?apikey=</code> on every Radarr/Sonarr/Tautulli/Jellyfin/Emby webhook URL — those services
+            aren&apos;t browser sessions and can&apos;t log in, so this is a separate credential just for them. Already
+            included automatically in the webhook URLs shown during setup.
+          </p>
+          <div className="flex items-center gap-2">
+            <span className="min-w-0 flex-1 truncate rounded-lg border border-[#424753]/40 bg-[#0b111b] px-3 py-2 font-mono text-[13px] text-slate-200">
+              {webhookKeyRevealed ? webhookKey || "(none yet)" : "•".repeat(Math.min(40, webhookKey.length || 40))}
+            </span>
+            <button
+              type="button"
+              className="shrink-0 px-3 py-2 rounded-lg text-[13px] border border-[#424753]/55 text-slate-300 hover:bg-[#252e3a]/80"
+              onClick={() => setWebhookKeyRevealed((v) => !v)}
+            >
+              {webhookKeyRevealed ? "Hide" : "Reveal"}
+            </button>
+          </div>
+          {!webhookRegenConfirming ? (
+            <button
+              type="button"
+              className="px-4 py-2 rounded-lg text-[13px] font-headline uppercase tracking-wider border border-[#424753]/55 text-slate-300 hover:bg-[#252e3a]/80"
+              onClick={() => setWebhookRegenConfirming(true)}
+            >
+              Regenerate
+            </button>
+          ) : (
+            <div className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+              <p className="text-[13px] text-amber-200">
+                This immediately invalidates the current key. Every already-configured Radarr/Sonarr/Tautulli/Jellyfin/Emby
+                webhook will start failing until you re-paste the updated URL from onboarding/settings into each of them.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={webhookRegenBusy}
+                  className="px-3 py-1.5 rounded-md text-[13px] bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-50"
+                  onClick={() => void onRegenerateWebhookKey()}
+                >
+                  {webhookRegenBusy ? "Regenerating…" : "Yes, regenerate"}
+                </button>
+                <button
+                  type="button"
+                  disabled={webhookRegenBusy}
+                  className="px-3 py-1.5 rounded-md text-[13px] border border-[#424753]/55 text-slate-300 hover:bg-[#252e3a]/80"
+                  onClick={() => setWebhookRegenConfirming(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          {webhookRegenError ? <p className="text-[14px] text-red-400">{webhookRegenError}</p> : null}
+          {webhookRegenMessage ? <p className="text-[14px] text-emerald-400">{webhookRegenMessage}</p> : null}
+        </div>
+      ) : null}
       {mode === "builtin" ? (
         <form onSubmit={(e) => void onChangePassword(e)} className="space-y-3 max-w-md">
           <p className="text-[14px] text-slate-400">Change password</p>
@@ -7433,6 +7542,8 @@ function SettingsPanel(props: {
                   authStatus={props.authStatus}
                   accentHex={accent.hex}
                   onLogout={props.onLogout}
+                  webhookApiKey={resolveWebhookApiKey(props.values)}
+                  onWebhookApiKeyChange={(key) => props.onValueChange("WEBHOOK_API_KEY", key)}
                 />
               ) : null}
               {active.name === "Paths" ? (
@@ -7872,6 +7983,7 @@ function SettingsPanel(props: {
         onClose={() => setPlaybackWebhookDialog(null)}
         accent={accent}
         displayOrigin={resolveWebhookDisplayOrigin(props.values)}
+        webhookApiKey={resolveWebhookApiKey(props.values)}
       />
     ) : null}
     </>
@@ -9304,9 +9416,13 @@ function PlaybackWebhookSetupModal(props: {
   onClose: () => void;
   accent: { hex: string };
   displayOrigin: string;
+  webhookApiKey: string;
 }) {
   const pb = props.dialog;
-  const webhookUrl = `${props.displayOrigin}/webhook?instance=${encodeURIComponent(pb.instanceParam)}`;
+  const webhookUrl = appendWebhookApiKey(
+    `${props.displayOrigin}/webhook?instance=${encodeURIComponent(pb.instanceParam)}`,
+    props.webhookApiKey,
+  );
   const svcMeta = PLAYBACK_WEBHOOK_SERVICES.services.find((s) => s.id === pb.serviceId);
   const name = svcMeta?.name ?? pb.serviceId;
   return (
@@ -10681,6 +10797,7 @@ function OnboardingWizard(props: {
           onClose={() => setPlaybackWebhookDialog(null)}
           accent={accent}
           displayOrigin={resolveWebhookDisplayOrigin(props.values)}
+          webhookApiKey={resolveWebhookApiKey(props.values)}
         />
       ) : null}
     </>
