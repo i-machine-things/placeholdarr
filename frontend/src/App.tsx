@@ -743,7 +743,19 @@ export function App() {
     setLastDashboardSuccessAt(Date.now());
   }, []);
 
+  // Several background hooks (dashboard events, health check, logs stream,
+  // library shelves, etc.) fire unconditionally regardless of auth state and
+  // hit gated endpoints, so a 401 here just means "not authenticated yet" —
+  // core/auth.py's auth_gate_middleware — not a real data-loading failure.
+  // Surfacing it as the visible error banner (which the /setup boot shell
+  // also reads from this same state) made the app look permanently stuck
+  // right after a successful login while other background polls were still
+  // catching up. authStatus (via useAuthStatusPoll) is the source of truth
+  // for auth state; this is just filtering noise out of an unrelated signal.
+  const isAuthRequiredMessage = (message: string) => message === "Authentication required";
+
   const markTabDataError = useCallback((message: string) => {
+    if (isAuthRequiredMessage(message)) return;
     setErrorMessage(message);
     setLoading(false);
   }, []);
@@ -755,6 +767,7 @@ export function App() {
   }, []);
 
   const markApiUnhealthy = useCallback((message: string) => {
+    if (isAuthRequiredMessage(message)) return;
     setErrorMessage(message);
     setLoading(false);
   }, []);
@@ -793,7 +806,7 @@ export function App() {
     enabled: currentTab === "library" && libraryListShelf !== null,
     liveVersionSync: eventsConnected,
     onSuccess: () => setLastDashboardSuccessAt(Date.now()),
-    onError: (message) => setErrorMessage(message),
+    onError: markTabDataError,
   });
 
   useEffect(() => {
@@ -1089,8 +1102,9 @@ export function App() {
           setErrorMessage(null);
         }
       } catch (err) {
-        if (!stopped) {
-          setErrorMessage(err instanceof Error ? err.message : "Unable to load setup. Check the API and try again.");
+        const message = err instanceof Error ? err.message : "Unable to load setup. Check the API and try again.";
+        if (!stopped && !isAuthRequiredMessage(message)) {
+          setErrorMessage(message);
         }
       }
       if (!stopped && !setupPreviewPath) {
@@ -1112,7 +1126,9 @@ export function App() {
       stopped = true;
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [currentTab, location.pathname, location.search]);
+    // Re-run once auth resolves too, so a fetch blocked pre-login retries
+    // immediately instead of waiting for the next tab-visibility event.
+  }, [currentTab, location.pathname, location.search, authStatus?.authenticated]);
 
   /** Settings: reload on tab focus when there are no unsaved edits (no periodic 5s poll). */
   useEffect(() => {
@@ -1255,8 +1271,9 @@ export function App() {
         setOnboardingStepIndex(0);
         setErrorMessage(null);
       } catch (e) {
-        if (!cancelled) {
-          setErrorMessage(e instanceof Error ? e.message : "Unable to load onboarding preview.");
+        const message = e instanceof Error ? e.message : "Unable to load onboarding preview.";
+        if (!cancelled && !isAuthRequiredMessage(message)) {
+          setErrorMessage(message);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -1265,7 +1282,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [location.pathname, location.search]);
+  }, [location.pathname, location.search, authStatus?.authenticated]);
 
   useEffect(() => {
     if (titleSearchIndex >= titleSearchResults.length) {
