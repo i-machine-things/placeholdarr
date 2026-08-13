@@ -1047,9 +1047,17 @@ def get_settings_payload(session=None) -> dict[str, Any]:
             if meta.get("nested"):
                 entry["nested"] = True
             grouped[meta["section"]].append(entry)
+
+        # Not a settings field (no SETTINGS_SCHEMA entry, not user-editable via
+        # save/reset) — exposed only so the frontend's webhook-URL builders
+        # (which already read this same values map) can display it. See
+        # core/auth.py for where it's actually generated/rotated.
+        from core.auth import get_webhook_api_key
+
         return {
             "status": get_onboarding_status(session=session),
             "sections": [{"name": name, "fields": fields} for name, fields in grouped.items()],
+            "webhook_api_key": get_webhook_api_key(session=session),
         }
     finally:
         if owns_session:

@@ -530,6 +530,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from core.auth import auth_gate_middleware
+app.add_middleware(BaseHTTPMiddleware, dispatch=auth_gate_middleware)
+
 # Dashboard UI
 from routes.dashboard import router as dashboard_router
 app.include_router(dashboard_router)
@@ -541,9 +545,18 @@ app.include_router(tasks_router)
 from routes.messages import router as messages_router
 app.include_router(messages_router)
 
+from routes.auth import router as auth_router
+app.include_router(auth_router)
+
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
+        from core.auth import verify_webhook_api_key
+
+        provided_key = request.query_params.get("apikey")
+        if not verify_webhook_api_key(provided_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing apikey")
+
         payload = await request.json()
         instance_raw = request.query_params.get("instance", "").strip() or None
         instance_id_raw = request.query_params.get("instance_id", "").strip() or None

@@ -29,7 +29,7 @@ import {
   type NfoBackfillApplyScope,
 } from "./api/dashboard";
 import { postTaskRun } from "./api/tasks";
-import { fetchJson, postJson } from "./api/client";
+import { fetchJson, postJson, setUnauthorizedHandler } from "./api/client";
 import embyIcon from "./assets/services/emby.svg";
 import jellyfinIcon from "./assets/services/jellyfin.svg";
 import plexIcon from "./assets/services/plex.svg";
@@ -44,6 +44,7 @@ import type {
   ActivityRow,
   ActivitySubPage,
   ArrInstanceOpenLink,
+  AuthStatus,
   ScheduledTaskRow,
   TaskRunRow,
   CalendarDay,
@@ -78,6 +79,9 @@ import { useApiHealthCheck } from "./dashboard/useApiHealthCheck";
 import { useDashboardEvents } from "./dashboard/useDashboardEvents";
 import { useSetupStatusPoll } from "./dashboard/useSetupStatusPoll";
 import { useStartupReadyPoll } from "./dashboard/useStartupReadyPoll";
+import { useAuthStatusPoll } from "./dashboard/useAuthStatusPoll";
+import { CreatePasswordScreen } from "./dashboard/CreatePasswordScreen";
+import { LoginScreen } from "./dashboard/LoginScreen";
 import {
   clearSetupCompleteInSession,
   markSetupCompleteInSession,
@@ -531,8 +535,10 @@ const BRAND_META: { label: string; tagline: string } = {
   tagline: "High fidelity simulation — your library as a living spec sheet.",
 };
 
-/** Branded first paint for /setup while settings load (Seerr-style splash: motion masks wait). */
-function SetupBootShell(props: {
+/** Branded first paint for /setup while settings load (Seerr-style splash: motion masks wait).
+ * Exported so CreatePasswordScreen/LoginScreen (pre-auth gate, rendered before /setup) can
+ * reuse it for their own loading state without duplicating the theme wrapper markup. */
+export function SetupBootShell(props: {
   setupShellClass: string;
   surfaceStyle: CSSProperties;
   brand: Brand;
@@ -613,7 +619,7 @@ function getBrandAccent(brand: Brand, theme: ThemeMode) {
   return BRAND_ACCENTS[key];
 }
 
-function BrandLogo(props: { brand: Brand; accentHex: string; className?: string; variant?: "blue" | "yellow" }) {
+export function BrandLogo(props: { brand: Brand; accentHex: string; className?: string; variant?: "blue" | "yellow" }) {
   void props.accentHex;
   const src = props.variant === "yellow" ? placeholdarrLogoYellow : placeholdarrLogoBlue;
   return (
@@ -701,6 +707,8 @@ export function App() {
     resolve: (scope: NfoBackfillApplyScope) => void;
     reject: (reason: unknown) => void;
   }>(null);
+
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
 
   const [setupStatus, setSetupStatus] = useState<SettingsStatus | null>(null);
   const setupCompleteRef = useRef<boolean | undefined>(undefined);
@@ -838,6 +846,18 @@ export function App() {
     onSuccess: markTabDataFresh,
     onError: markTabDataError,
   });
+
+  useAuthStatusPoll({
+    enabled: true,
+    onStatus: setAuthStatus,
+  });
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : prev));
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   useSetupStatusPoll({
     enabled: currentTab !== "setup" || setupStatus?.setup_complete === true,
@@ -1361,6 +1381,10 @@ export function App() {
         nextValues[field.key] = field.value;
       });
     });
+    // Not a settings field — read-only, used only by the webhook-URL builders
+    // below (resolveWebhookApiKey). See services/app_config.py's
+    // get_settings_payload() for where this comes from.
+    nextValues.WEBHOOK_API_KEY = payload.webhook_api_key ?? "";
 
     setFieldValues(nextValues);
     setBaselineValues(nextValues);
@@ -1852,6 +1876,51 @@ export function App() {
       /* ignore */
     }
   }, [themeMode]);
+
+  // Gate runs before the /setup check below on purpose: on a totally fresh
+  // install (or after upgrading an existing install that never had a
+  // password set), this must intercept even a direct/bookmarked visit to
+  // /setup, so the credential-entry onboarding step is never reachable
+  // unauthenticated. See core/auth.py's auth_gate_middleware for the
+  // matching server-side enforcement — this is a UX nicety on top of that,
+  // not the actual security boundary.
+  if (!authStatus || !authStatus.password_set || !authStatus.authenticated) {
+    const authShellClass = `brand-theme-scope theme-${themeMode} layout-${brand}-${themeMode} min-h-screen flex items-center justify-center font-brand-body text-[16px] font-headline tracking-wide ${themeMode === "light" ? "text-slate-700" : "text-slate-300"}`;
+    if (!authStatus) {
+      return (
+        <SetupBootShell
+          setupShellClass={authShellClass}
+          surfaceStyle={setupLoadingShellStyle}
+          brand={brand}
+          accentHex={brandAccent.hex}
+          appLabel={brandMeta.label}
+          statusMessage="Loading…"
+        />
+      );
+    }
+    if (!authStatus.password_set) {
+      return (
+        <CreatePasswordScreen
+          setupShellClass={authShellClass}
+          surfaceStyle={setupLoadingShellStyle}
+          brand={brand}
+          accentHex={brandAccent.hex}
+          appLabel={brandMeta.label}
+          onSuccess={() => setAuthStatus({ password_set: true, authenticated: true })}
+        />
+      );
+    }
+    return (
+      <LoginScreen
+        setupShellClass={authShellClass}
+        surfaceStyle={setupLoadingShellStyle}
+        brand={brand}
+        accentHex={brandAccent.hex}
+        appLabel={brandMeta.label}
+        onSuccess={() => setAuthStatus((prev) => (prev ? { ...prev, authenticated: true } : { password_set: true, authenticated: true }))}
+      />
+    );
+  }
 
   const setupRouteActive = location.pathname === "/setup" || location.pathname.startsWith("/setup/");
   if (setupRouteActive) {
@@ -5080,11 +5149,24 @@ function resolveWebhookDisplayOrigin(values: FieldValueMap): string {
   return typeof window !== "undefined" ? window.location.origin : "";
 }
 
-function buildArrInstanceWebhookUrls(origin: string, instance_id: string, instance_key: string) {
+/** /webhook requires ?apikey= (see core/auth.py's verify_webhook_api_key) —
+ * read from the same values map the settings payload already populates it
+ * into (App.tsx's loadSettings), so no separate fetch/prop-threading is needed. */
+function resolveWebhookApiKey(values: FieldValueMap): string {
+  return String(values.WEBHOOK_API_KEY ?? "").trim();
+}
+
+function appendWebhookApiKey(url: string, apiKey: string): string {
+  if (!url || !apiKey) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}apikey=${encodeURIComponent(apiKey)}`;
+}
+
+function buildArrInstanceWebhookUrls(origin: string, instance_id: string, instance_key: string, apiKey: string) {
   const id = String(instance_id || "").trim().toLowerCase();
   const key = normalizeInstanceKey(String(instance_key || ""));
-  const byId = id ? `${origin}/webhook?instance_id=${encodeURIComponent(id)}` : "";
-  const byKey = `${origin}/webhook?instance=${encodeURIComponent(key)}`;
+  const byId = id ? appendWebhookApiKey(`${origin}/webhook?instance_id=${encodeURIComponent(id)}`, apiKey) : "";
+  const byKey = appendWebhookApiKey(`${origin}/webhook?instance=${encodeURIComponent(key)}`, apiKey);
   const uuidLike = id.length > 0 && arrInstanceIdEmbedsUuid(id);
   const primary = id ? byId : byKey;
   return { primary, byId: id ? byId : "", byKey, uuidLike };
@@ -5653,7 +5735,8 @@ function ArrInstancesEditor(props: {
 
   function instanceWebhookUrls(instance_id: string, instance_key: string) {
     const origin = resolveWebhookDisplayOrigin(props.values);
-    return buildArrInstanceWebhookUrls(origin, instance_id, instance_key);
+    const apiKey = resolveWebhookApiKey(props.values);
+    return buildArrInstanceWebhookUrls(origin, instance_id, instance_key, apiKey);
   }
 
   function onSlotPanelSaveClick() {
@@ -7535,6 +7618,7 @@ function SettingsPanel(props: {
         onClose={() => setPlaybackWebhookDialog(null)}
         accent={accent}
         displayOrigin={resolveWebhookDisplayOrigin(props.values)}
+        webhookApiKey={resolveWebhookApiKey(props.values)}
       />
     ) : null}
     </>
@@ -8961,9 +9045,13 @@ function PlaybackWebhookSetupModal(props: {
   onClose: () => void;
   accent: { hex: string };
   displayOrigin: string;
+  webhookApiKey: string;
 }) {
   const pb = props.dialog;
-  const webhookUrl = `${props.displayOrigin}/webhook?instance=${encodeURIComponent(pb.instanceParam)}`;
+  const webhookUrl = appendWebhookApiKey(
+    `${props.displayOrigin}/webhook?instance=${encodeURIComponent(pb.instanceParam)}`,
+    props.webhookApiKey,
+  );
   const svcMeta = PLAYBACK_WEBHOOK_SERVICES.services.find((s) => s.id === pb.serviceId);
   const name = svcMeta?.name ?? pb.serviceId;
   return (
@@ -10304,6 +10392,7 @@ function OnboardingWizard(props: {
           onClose={() => setPlaybackWebhookDialog(null)}
           accent={accent}
           displayOrigin={resolveWebhookDisplayOrigin(props.values)}
+          webhookApiKey={resolveWebhookApiKey(props.values)}
         />
       ) : null}
     </>

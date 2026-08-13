@@ -34,7 +34,6 @@ tools/
 scripts/
 services_old/
 docs/
-tests/
 .archive/
 .github/agents
 
