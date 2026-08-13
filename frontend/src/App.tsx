@@ -82,6 +82,7 @@ import { useStartupReadyPoll } from "./dashboard/useStartupReadyPoll";
 import { useAuthStatusPoll } from "./dashboard/useAuthStatusPoll";
 import { CreatePasswordScreen } from "./dashboard/CreatePasswordScreen";
 import { LoginScreen } from "./dashboard/LoginScreen";
+import { getAuthStatus } from "./api/auth";
 import {
   clearSetupCompleteInSession,
   markSetupCompleteInSession,
@@ -853,8 +854,17 @@ export function App() {
   });
 
   useEffect(() => {
+    // Re-check against the server rather than optimistically flipping to
+    // unauthenticated: plenty of background polls (health check, SSE
+    // fallback, settings status, etc.) fire regardless of auth state, so a
+    // stale 401 from a request that was already in flight when login/setup
+    // succeeded must not stomp a freshly-authenticated state back to false.
     setUnauthorizedHandler(() => {
-      setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : prev));
+      void getAuthStatus()
+        .then(setAuthStatus)
+        .catch(() => {
+          /* transient network error — next poll will retry */
+        });
     });
     return () => setUnauthorizedHandler(null);
   }, []);
